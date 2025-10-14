@@ -88,12 +88,13 @@ public class OSC: OSCSettingsDelegate {
 #if !targetEnvironment(simulator)
         client = OSCClient()
         
-        server = OSCServer(port: UInt16(settings.serverPort)) { [weak self] message, timeTag, host, port in
+        let port = UInt16(max(Int(UInt16.min), min(Int(UInt16.max), settings.serverPort)))
+        server = OSCServer(port: port) { [weak self] message, timeTag, host, port in
             self?.take(message: message)
         }
 
         Task { @MainActor in
-            isServerPortOpen = OSC.isPortOpen(port: in_port_t(settings.serverPort))
+            isServerPortOpen = OSC.isPortOpen(settings.serverPort)
         }
 #endif
         
@@ -456,7 +457,8 @@ public class OSC: OSCSettingsDelegate {
     // MARK: - Port
     
     public static func isPortOpen(_ port: Int) -> Bool {
-        isPortOpen(port: in_port_t(port))
+        let port = UInt16(max(Int(UInt16.min), min(Int(UInt16.max), port)))
+        return isPortOpen(port: in_port_t(port))
     }
     
     static func isPortOpen(port: in_port_t) -> Bool {

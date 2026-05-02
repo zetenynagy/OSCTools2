@@ -18,6 +18,19 @@ import Combine
 public class OSC: OSCSettingsDelegate {
     
     private let queue: DispatchQueue
+    private let queueKey = DispatchSpecificKey<Void>()
+    
+    private struct SendSettings {
+        var clientAddress: String
+        var clientPort: UInt16
+    }
+    
+    @ObservationIgnored
+    private var sendSettings: SendSettings
+    @ObservationIgnored
+    private var sendActive: Bool = true
+    @ObservationIgnored
+    private var sendUpdatesRecentOutput: Bool = false
     
     @MainActor
     public let connection: OSCConnection = .init()
@@ -40,7 +53,11 @@ public class OSC: OSCSettingsDelegate {
     @MainActor
     public private(set) var updateRecentInput: Bool = false
     @MainActor
-    public private(set) var updateRecentOutput: Bool = false
+    public private(set) var updateRecentOutput: Bool = false {
+        didSet {
+            updateSendRecentOutput(updateRecentOutput)
+        }
+    }
     @MainActor
     public private(set) var recentInput: Bool = false
     @MainActor
@@ -57,6 +74,7 @@ public class OSC: OSCSettingsDelegate {
     @ObservationIgnored
     public var active: Bool = true {
         didSet {
+            updateSendActive(active)
             if active {
                 start()
             } else {
@@ -74,6 +92,11 @@ public class OSC: OSCSettingsDelegate {
     
     public init(queue: DispatchQueue = .main) {
         self.queue = queue
+        sendSettings = SendSettings(
+            clientAddress: settings.clientAddress,
+            clientPort: Self.clampedPort(settings.clientPort)
+        )
+        queue.setSpecific(key: queueKey, value: ())
         listenToApp()
         Task { @MainActor in
             setup()
@@ -272,31 +295,40 @@ public class OSC: OSCSettingsDelegate {
     // MARK: - Send
     
     public func send(value: any OSCValue, address: String) {
-        let value: any OSCValue = if let float = value as? CGFloat {
-            Float(truncating: NSNumber(value: (float)))
-        } else if let double = value as? Double {
-            Float(truncating: NSNumber(value: (double)))
-        } else {
-            value
-        }
         send(values: [value], address: address)
     }
     
     public func send(values: [any OSCValue], address: String) {
-        
-        guard active else { return }
+        let values = values.map(Self.sendValue)
+        performOnQueue { [self] in
+            sendOnQueue(values: values, address: address)
+        }
+    }
+    
+    private static func sendValue(_ value: any OSCValue) -> any OSCValue {
+        if let float = value as? CGFloat {
+            Float(float)
+        } else if let double = value as? Double {
+            Float(double)
+        } else {
+            value
+        }
+    }
+    
+    private func sendOnQueue(values: [any OSCValue], address: String) {
+        guard sendActive else { return }
         
         Logger.log(arguments: ["address": address, "values": values], frequency: .loop)
         
 #if !targetEnvironment(simulator)
         do {
             let message: OSCMessage = .message(address, values: values)
-            try self.client?.send(message, to: settings.clientAddress, port: UInt16(settings.clientPort))
+            try client?.send(message, to: sendSettings.clientAddress, port: sendSettings.clientPort)
         } catch {
             Logger.log(.error(error), message: "OSC Message Failed to Send", arguments: ["address": address, "values": values])
         }
-        Task { @MainActor in
-            if updateRecentOutput {
+        if sendUpdatesRecentOutput {
+            Task { @MainActor in
                 setRecentOutput()
             }
         }
@@ -457,8 +489,7 @@ public class OSC: OSCSettingsDelegate {
     // MARK: - Port
     
     public static func isPortOpen(_ port: Int) -> Bool {
-        let port = UInt16(max(Int(UInt16.min), min(Int(UInt16.max), port)))
-        return isPortOpen(port: in_port_t(port))
+        isPortOpen(port: in_port_t(clampedPort(port)))
     }
     
     static func isPortOpen(port: in_port_t) -> Bool {
@@ -488,11 +519,19 @@ public class OSC: OSCSettingsDelegate {
     
     // MARK: - Settings Delegate
     
-    public func setting(clientAddress: String) {}
+    public func setting(clientAddress: String) {
+        updateSendSettings { sendSettings in
+            sendSettings.clientAddress = clientAddress
+        }
+    }
     
     func setting(preferredServerAddress: String?) {}
     
-    public func setting(clientPort: Int) {}
+    public func setting(clientPort: Int) {
+        updateSendSettings { sendSettings in
+            sendSettings.clientPort = Self.clampedPort(clientPort)
+        }
+    }
     
     public func setting(serverPort: Int) {
         tearDown()
@@ -500,5 +539,37 @@ public class OSC: OSCSettingsDelegate {
             isServerPortOpen = OSC.isPortOpen(port: in_port_t(serverPort))
             setup()
         }
+    }
+    
+    // MARK: - Send Queue
+    
+    private func performOnQueue(_ work: @escaping () -> Void) {
+        if DispatchQueue.getSpecific(key: queueKey) != nil {
+            work()
+        } else {
+            queue.async(execute: work)
+        }
+    }
+    
+    private func updateSendSettings(_ update: @escaping (inout SendSettings) -> Void) {
+        performOnQueue { [self] in
+            update(&sendSettings)
+        }
+    }
+    
+    private func updateSendActive(_ active: Bool) {
+        performOnQueue { [self] in
+            sendActive = active
+        }
+    }
+    
+    private func updateSendRecentOutput(_ isEnabled: Bool) {
+        performOnQueue { [self] in
+            sendUpdatesRecentOutput = isEnabled
+        }
+    }
+    
+    private static func clampedPort(_ port: Int) -> UInt16 {
+        UInt16(max(Int(UInt16.min), min(Int(UInt16.max), port)))
     }
 }

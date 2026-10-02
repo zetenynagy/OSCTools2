@@ -17,6 +17,7 @@ public class OSC {
     @ObservationIgnored private var observingLifecycle = false
     @ObservationIgnored private var wantsRunning = false
     @ObservationIgnored private var isTornDown = false
+    @ObservationIgnored private var sendingInterfaceAvailable = true
     @ObservationIgnored private var recentInputTimer: Timer?
     @ObservationIgnored private var recentOutputTimer: Timer?
 
@@ -50,31 +51,55 @@ public class OSC {
     }
 
     /// Supply separate settings for independent OSC instances, or share them intentionally.
-    public init(settings: OSCSettings, queue: DispatchQueue = .main,
+    public convenience init(settings: OSCSettings, queue: DispatchQueue = .main,
                 autoStart: Bool = true, manageLifecycle: Bool = true) {
+        self.init(settings: settings, queue: queue, autoStart: autoStart,
+                  manageLifecycle: manageLifecycle, connection: OSCConnection())
+    }
+
+    init(settings: OSCSettings, queue: DispatchQueue = .main,
+         autoStart: Bool = true, manageLifecycle: Bool = true, connection: OSCConnection) {
         self.settings = settings
         self.queue = queue
-        sender = OSCSender(destination: OSCEndpoint(host: settings.clientAddress, port: Self.clampedPort(settings.clientPort)))
+        self.connection = connection
+        connection.preferredIPAddress = settings.preferredServerAddress
+        sender = OSCSender(destination: OSCEndpoint(host: settings.clientAddress, port: Self.clampedPort(settings.clientPort)),
+                           interface: settings.preferredServerAddress)
         receiver = OSCReceiver(port: Self.clampedPort(settings.serverPort))
-        connection = OSCConnection()
+        sendingInterfaceAvailable = settings.preferredServerAddress.map { connection.allIpAddresses.contains($0) } ?? true
+        connection.addressesDidChange = { [weak self] in self?.refreshSendingInterface() }
+        sender.setErrorHandler { [weak self] description, generation in
+            self?.reportSendError(description, generation: generation)
+        }
         settingsObserver = settings.observe { [weak self] change in self?.settingsChanged(change) }
         if manageLifecycle { listenToApp() }
         if autoStart { start() }
-        if let preferred = settings.preferredServerAddress { connection.setCurrent(ipAddress: preferred) }
     }
 
     public func start() {
         guard !isTornDown, active else { return }
         wantsRunning = true
+        connection.check()
 #if !targetEnvironment(simulator)
         do {
-            try sender.start()
             try receiver.start()
             isServerPortOpen = receiver.isRunning
-            lastError = nil
         } catch {
             sender.stop()
             isServerPortOpen = false
+            lastError = error.localizedDescription
+            return
+        }
+        guard sendingInterfaceAvailable else {
+            sender.stop()
+            lastError = unavailableInterfaceDescription
+            return
+        }
+        do {
+            try sender.start()
+            lastError = nil
+        } catch {
+            // A send-side bind failure must not interrupt wildcard receiving.
             lastError = error.localizedDescription
         }
 #endif
@@ -94,9 +119,11 @@ public class OSC {
         NotificationCenter.default.removeObserver(self)
         observingLifecycle = false
         sender.setActivityHandler(nil)
+        sender.setErrorHandler(nil)
         receiver.setActivityHandler(nil)
         recentInputTimer?.invalidate()
         recentOutputTimer?.invalidate()
+        connection.addressesDidChange = nil
         connection.stop()
     }
 
@@ -115,7 +142,7 @@ public class OSC {
         case .serverPort:
             configureReceiver(port: Self.clampedPort(settings.serverPort))
         case .preferredServerAddress:
-            if let address = settings.preferredServerAddress { connection.setCurrent(ipAddress: address) }
+            connection.preferredIPAddress = settings.preferredServerAddress
         }
     }
 
@@ -151,12 +178,36 @@ public class OSC {
     }
 
     public func setPreferred(ipAddress: String) {
-        connection.setCurrent(ipAddress: ipAddress)
         settings.preferredServerAddress = ipAddress
     }
     public func resetPreferredIPAddress() {
-        connection.resetCurrentIPAddress()
         settings.preferredServerAddress = nil
+    }
+
+    private var unavailableInterfaceDescription: String {
+        "Selected local IP address \(settings.preferredServerAddress ?? "") is unavailable. Select another IP address or Default."
+    }
+
+    private func refreshSendingInterface() {
+        guard !isTornDown else { return }
+        let preferred = settings.preferredServerAddress
+        let available = preferred.map { connection.allIpAddresses.contains($0) } ?? true
+        guard sender.interface != preferred || available != sendingInterfaceAvailable else { return }
+        sendingInterfaceAvailable = available
+        do {
+            if !available { sender.stop() }
+            try sender.configure(interface: preferred)
+            if !available {
+                lastError = unavailableInterfaceDescription
+            } else {
+#if !targetEnvironment(simulator)
+                if active, wantsRunning, receiver.isRunning { try sender.start() }
+#endif
+                lastError = nil
+            }
+        } catch {
+            lastError = error.localizedDescription
+        }
     }
 
     // Legacy send preserves numeric conversion and the caller's configured sending queue.
@@ -190,7 +241,8 @@ public class OSC {
         }
         guard report else { return }
         Task { @MainActor [weak self] in
-            guard let self, self.sender.activeGeneration == generation, !self.isTornDown else { return }
+            guard let self, self.sender.matchesGeneration(generation), self.active,
+                  self.wantsRunning, !self.isTornDown else { return }
             self.lastError = description
         }
     }
@@ -251,11 +303,11 @@ public class OSC {
     }
     @objc func didBecomeActive() {
         guard !isTornDown else { return }
+        connection.start()
+        connection.check()
 #if !os(macOS)
         if active, wantsRunning { start() }
 #endif
-        connection.start()
-        connection.check()
     }
     @objc func willResignActive() {
 #if !os(macOS)

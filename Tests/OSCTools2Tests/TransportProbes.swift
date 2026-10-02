@@ -11,10 +11,18 @@ final class SenderProbe: OSCSendingTransport {
         var stops = 0
         var messages: [(OSCMessage, OSCEndpoint)] = []
         var fail = false
+        var failStart = false
+        var errorHandler: (@Sendable (OSCSendingFailure) -> Void)?
     }
     let state = OSAllocatedUnfairLock(initialState: State())
-    func start() throws { state.withLock { $0.starts += 1 } }
+    func start() throws {
+        try state.withLock {
+            $0.starts += 1
+            if $0.failStart { throw ProbeError() }
+        }
+    }
     func stop() { state.withLock { $0.stops += 1 } }
+    func setErrorHandler(_ handler: (@Sendable (OSCSendingFailure) -> Void)?) { state.withLock { $0.errorHandler = handler } }
     func send(_ message: OSCMessage, to endpoint: OSCEndpoint) throws {
         try state.withLock {
             if $0.fail { throw ProbeError() }

@@ -94,6 +94,17 @@ public class OSCConnection {
     private var currentIpAddressContinuation: AsyncStream<String?>.Continuation?
     
     public private(set) var allIpAddresses: [String] = []
+
+    @ObservationIgnored var addressesDidChange: (() -> Void)?
+    @ObservationIgnored var preferredIPAddress: String? {
+        didSet {
+            if preferredIPAddress != oldValue { currentIpAddress = nil }
+            check()
+        }
+    }
+    @ObservationIgnored private let addressProvider: () -> [String]
+    @ObservationIgnored private let monitorsNetwork: Bool
+    @ObservationIgnored private var pathMonitors: [NWPathMonitor] = []
     
     // Connectivity's default global queue races its mutable URLSession between checks.
     // Keep its configuration, notifier, and status work on the same queue as this UI model.
@@ -107,7 +118,13 @@ public class OSCConnection {
     private var notifierGeneration: UInt64 = 0
     private var isNotifying = false
     
-    public init() {
+    public convenience init() {
+        self.init(addressProvider: Self.getAddresses, monitorsNetwork: true)
+    }
+
+    init(addressProvider: @escaping () -> [String], monitorsNetwork: Bool) {
+        self.addressProvider = addressProvider
+        self.monitorsNetwork = monitorsNetwork
         Logger.log(frequency: .verbose)
        
         check()
@@ -116,18 +133,16 @@ public class OSCConnection {
     
     func setCurrent(ipAddress: String) {
         Logger.log(arguments: ["ipAddress": ipAddress], frequency: .verbose)
-        guard allIpAddresses.contains(ipAddress) else { return }
-        currentIpAddress = ipAddress
+        preferredIPAddress = ipAddress
     }
     
     func resetCurrentIPAddress() {
         Logger.log(frequency: .verbose)
-        currentIpAddress = nil
-        check()
+        preferredIPAddress = nil
     }
     
     public func start() {
-        guard !isNotifying else { return }
+        guard monitorsNetwork, !isNotifying else { return }
         isNotifying = true
         Logger.log(frequency: .verbose)
         notifierGeneration &+= 1
@@ -153,6 +168,20 @@ public class OSCConnection {
             }
         }
         connectivity.startNotifier()
+
+        // The internet/default path can stay cellular while offline Wi-Fi or
+        // wired lighting networks join, leave, or change their local addresses.
+        pathMonitors = [NWPathMonitor(), NWPathMonitor(requiredInterfaceType: .wifi),
+                        NWPathMonitor(requiredInterfaceType: .wiredEthernet)]
+        for monitor in pathMonitors {
+            monitor.pathUpdateHandler = { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    guard let self, self.notifierGeneration == generation else { return }
+                    self.check()
+                }
+            }
+            monitor.start(queue: .global(qos: .utility))
+        }
     }
     
     public func stop() {
@@ -163,12 +192,21 @@ public class OSCConnection {
         connectivity.stopNotifier()
         connectivity.whenConnected = nil
         connectivity.whenDisconnected = nil
+        pathMonitors.forEach { $0.cancel() }
+        pathMonitors.removeAll()
     }
     
     /// Check IP Address
     public func check() {
-#if !targetEnvironment(simulator)
-        let addresses = getAddresses()
+        let addresses = Array(Set(addressProvider())).sorted()
+        if allIpAddresses != addresses { allIpAddresses = addresses }
+        if let preferredIPAddress {
+            // Preserve the explicit choice without silently selecting another IP.
+            let selected = addresses.contains(preferredIPAddress) ? preferredIPAddress : nil
+            if currentIpAddress != selected { currentIpAddress = selected }
+            addressesDidChange?()
+            return
+        }
         var targetIPAddress: String?
         let mainTargets: [String] = ["192.168"]
         loop: for target in mainTargets {
@@ -197,18 +235,18 @@ public class OSCConnection {
         } else {
             self.currentIpAddress = targetIPAddress ?? addresses.first
         }
-        self.allIpAddresses = addresses
         Logger.log(arguments: ["addresses": addresses, "targetAddress": targetIPAddress], frequency: .verbose)
-#endif
+        addressesDidChange?()
     }
     
     isolated deinit {
         connectivity.stopNotifier()
+        pathMonitors.forEach { $0.cancel() }
         statusContinuation?.finish()
         currentIpAddressContinuation?.finish()
     }
 
-    private func getAddresses() -> [String] {
+    nonisolated private static func getAddresses() -> [String] {
         var addresses = [String]()
 
         // Get list of all interfaces on the local machine:
@@ -225,7 +263,7 @@ public class OSCConnection {
 
             // Check for running IPv4, IPv6 interfaces. Skip the loopback interface.
             if (flags & (IFF_UP|IFF_RUNNING|IFF_LOOPBACK)) == (IFF_UP|IFF_RUNNING) {
-                if addr.sa_family == UInt8(AF_INET) || addr.sa_family == UInt8(AF_INET6) {
+                if addr.sa_family == UInt8(AF_INET) {
 
                     // Convert interface address to a human readable string:
                     var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
@@ -238,8 +276,24 @@ public class OSCConnection {
             }
         }
 
-        return addresses.filter { address in
-            address.contains(".")
+        return addresses
+    }
+
+    nonisolated static func interfaceIndex(for address: String) -> UInt32? {
+        var interfaces: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&interfaces) == 0 else { return nil }
+        defer { freeifaddrs(interfaces) }
+        guard let first = interfaces else { return nil }
+        for item in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            guard let addr = item.pointee.ifa_addr, addr.pointee.sa_family == UInt8(AF_INET),
+                  let name = item.pointee.ifa_name else { continue }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            guard getnameinfo(addr, socklen_t(addr.pointee.sa_len), &host, socklen_t(host.count),
+                              nil, 0, NI_NUMERICHOST) == 0,
+                  String(decoding: host.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self) == address else { continue }
+            let index = if_nametoindex(name)
+            if index != 0 { return index }
         }
+        return nil
     }
 }

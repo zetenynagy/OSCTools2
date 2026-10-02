@@ -1,4 +1,4 @@
-// swift-tools-version: 5.9
+// swift-tools-version: 6.4
 
 import PackageDescription
 
@@ -26,6 +26,10 @@ let package = Package(
                 .product(name: "Connectivity", package: "connectivity"),
                 "Logger"
             ]
+        ),
+        .testTarget(
+            name: "OSCTools2Tests",
+            dependencies: ["OSCTools2"]
         ),
     ]
 )

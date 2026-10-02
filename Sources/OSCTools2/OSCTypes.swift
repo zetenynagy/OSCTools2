@@ -9,7 +9,7 @@ import Foundation
 import CoreGraphics
 import OSCKit
 
-public protocol OSCType {
+public protocol OSCType: SendableMetatype {
     static func convert(value: Any) -> Self
 }
 

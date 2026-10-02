@@ -1,68 +1,75 @@
-//
-//  Created by Heestand XYZ on 2020-11-23.
-//  Copyright © 2020 Anton Heestand. All rights reserved.
-//
-
 import Foundation
-import Combine
+import Observation
 
-protocol OSCSettingsDelegate: AnyObject {
-    func setting(clientAddress: String)
-    func setting(preferredServerAddress: String?)
-    func setting(clientPort: Int)
-    func setting(serverPort: Int)
-}
-
-@Observable
+/// Observable settings for the OSC facade. Standalone transports never persist settings.
+@MainActor @Observable
 public class OSCSettings {
-    
-    @ObservationIgnored
-    weak var delegate: OSCSettingsDelegate?
-        
-    public static let kDefaultClientAddress: String = "localhost"
-    public static let kDefaultClientPort: Int = 8000
-    public static let kDefaultServerPort: Int = 7000
-        
+    public enum Persistence {
+        case none
+        /// A nil namespace retains the keys used by previous OSCTools2 releases.
+        case userDefaults(UserDefaults, namespace: String?)
+    }
+    enum Change { case clientAddress, clientPort, serverPort, preferredServerAddress }
+
+    nonisolated public static let kDefaultClientAddress = "localhost"
+    nonisolated public static let kDefaultClientPort = 8000
+    nonisolated public static let kDefaultServerPort = 7000
+
+    @ObservationIgnored private let persistence: Persistence
+    @ObservationIgnored private var observers: [UUID: (Change) -> Void] = [:]
+
     public var clientAddress: String {
-        didSet {
-            UserDefaults.standard.set(clientAddress, forKey: "setting-client-address")
-            delegate?.setting(clientAddress: clientAddress)
-        }
+        didSet { persist(clientAddress, key: "setting-client-address"); notify(.clientAddress) }
     }
-    
     public var preferredServerAddress: String? {
-        didSet {
-            UserDefaults.standard.set(preferredServerAddress, forKey: "setting-preferred-server-address")
-            delegate?.setting(preferredServerAddress: preferredServerAddress)
-        }
+        didSet { persist(preferredServerAddress, key: "setting-preferred-server-address"); notify(.preferredServerAddress) }
     }
-    
     public var clientPort: Int {
-        didSet {
-            UserDefaults.standard.set(clientPort, forKey: "setting-client-port")
-            delegate?.setting(clientPort: clientPort)
-        }
+        didSet { persist(clientPort, key: "setting-client-port"); notify(.clientPort) }
     }
-    
     public var serverPort: Int {
-        didSet {
-            UserDefaults.standard.set(serverPort, forKey: "setting-server-port")
-            delegate?.setting(serverPort: serverPort)
+        didSet { persist(serverPort, key: "setting-server-port"); notify(.serverPort) }
+    }
+
+    /// Existing apps retain their saved configuration without changing OSC().
+    public convenience init() {
+        self.init(persistence: .userDefaults(.standard, namespace: nil))
+    }
+
+    /// Explicitly constructed settings default to in-memory storage for independent instances.
+    public init(clientAddress: String = kDefaultClientAddress,
+                clientPort: Int = kDefaultClientPort,
+                serverPort: Int = kDefaultServerPort,
+                preferredServerAddress: String? = nil,
+                persistence: Persistence = .none) {
+        self.persistence = persistence
+        if case let .userDefaults(defaults, namespace) = persistence {
+            func key(_ key: String) -> String { namespace.map { "\($0).\(key)" } ?? key }
+            self.clientAddress = defaults.string(forKey: key("setting-client-address")) ?? clientAddress
+            let savedClientPort = defaults.integer(forKey: key("setting-client-port"))
+            self.clientPort = savedClientPort == 0 ? clientPort : savedClientPort
+            let savedServerPort = defaults.integer(forKey: key("setting-server-port"))
+            self.serverPort = savedServerPort == 0 ? serverPort : savedServerPort
+            self.preferredServerAddress = defaults.string(forKey: key("setting-preferred-server-address")) ?? preferredServerAddress
+        } else {
+            self.clientAddress = clientAddress
+            self.clientPort = clientPort
+            self.serverPort = serverPort
+            self.preferredServerAddress = preferredServerAddress
         }
     }
-    
-    init() {
-        
-        let clientAddress = UserDefaults.standard.string(forKey: "setting-client-address")
-        self.clientAddress = clientAddress ?? OSCSettings.kDefaultClientAddress
-        
-        let preferredServerAddress = UserDefaults.standard.string(forKey: "setting-preferred-server-address")
-        self.preferredServerAddress = preferredServerAddress
-        
-        let clientPort = UserDefaults.standard.integer(forKey: "setting-client-port")
-        self.clientPort = clientPort != 0 ? clientPort : OSCSettings.kDefaultClientPort
-        
-        let serverPort = UserDefaults.standard.integer(forKey: "setting-server-port")
-        self.serverPort = serverPort != 0 ? serverPort : OSCSettings.kDefaultServerPort
+
+    func observe(_ callback: @escaping (Change) -> Void) -> UUID {
+        let id = UUID()
+        observers[id] = callback
+        return id
+    }
+    func removeObserver(_ id: UUID) { observers.removeValue(forKey: id) }
+    private func notify(_ change: Change) {
+        for callback in observers.values { callback(change) }
+    }
+    private func persist(_ value: Any?, key: String) {
+        guard case let .userDefaults(defaults, namespace) = persistence else { return }
+        defaults.set(value, forKey: namespace.map { "\($0).\(key)" } ?? key)
     }
 }

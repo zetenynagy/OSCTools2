@@ -1,66 +1,78 @@
 import Foundation
 import Network
 
-/// Uses bonjour networking to reliably check if user has granted local network access
-/// How to use:
-
-/// Add LocalNetworkAuthorization class to your project
-/// Open .plist file and add "_bonjour._tcp", "_lnp._tcp.", as a values under "Bonjour services"
-/// Call requestAuthorization() to trigger the prompt or get the authorization status if it already been approved/denied
-/// about the author: https://stackoverflow.com/a/67758105/705761
+/// Bonjour-based local-network authorization. State and completion callbacks stay on the main actor.
+/// Apps need `_bonjour._tcp` and `_lnp._tcp.` in their Bonjour services Info.plist entry.
+/// Adapted from https://stackoverflow.com/a/67758105/705761.
+@MainActor
 public class LocalNetworkAuthorization: NSObject {
-    
     private var browser: NWBrowser?
     private var netService: NetService?
     private var completion: ((Bool) -> Void)?
-    
+    private var generation: UInt64 = 0
+
     public func requestAuthorization(completion: @escaping (Bool) -> Void) {
-        
+        let previous = self.completion
+        reset()
         self.completion = completion
-        
-        // Create parameters, and allow browsing over peer-to-peer link.
+        let generation = self.generation
         let parameters = NWParameters()
         parameters.includePeerToPeer = true
-        
-        // Browse for a custom service type.
         let browser = NWBrowser(for: .bonjour(type: "_bonjour._tcp", domain: nil), using: parameters)
         self.browser = browser
-        browser.stateUpdateHandler = { newState in
-            switch newState {
-            case .failed(let error):
-                print(error.localizedDescription)
-            case .ready, .cancelled:
-                break
-            case let .waiting(error):
-                print("Local network permission has been denied: \(error)")
-                self.reset()
-                self.completion?(false)
-            default:
-                break
+        browser.stateUpdateHandler = { [weak self] state in
+            Task { @MainActor in
+                guard let self, self.generation == generation else { return }
+                switch state {
+                case .failed, .waiting: self.complete(false)
+                default: break
+                }
             }
         }
-        
-        self.netService = NetService(domain: "local.", type:"_lnp._tcp.", name: "LocalNetworkPrivacy", port: 1100)
-        self.netService?.delegate = self
-        
-        self.browser?.start(queue: .main)
-        self.netService?.schedule(in: .main, forMode: .common)
-        self.netService?.publish()
+        let service = NetService(domain: "local.", type: "_lnp._tcp.", name: "LocalNetworkPrivacy", port: 1100)
+        netService = service
+        service.delegate = self
+        browser.start(queue: .main)
+        service.schedule(in: .main, forMode: .common)
+        service.publish()
+        // Complete the superseded request after installing this one, allowing safe reentry.
+        previous?(false)
     }
-    
-    
+
     private func reset() {
-        self.browser?.cancel()
-        self.browser = nil
-        self.netService?.stop()
-        self.netService = nil
+        generation &+= 1
+        browser?.cancel()
+        browser = nil
+        netService?.stop()
+        netService = nil
+        completion = nil
+    }
+
+    private func complete(_ authorized: Bool) {
+        let completion = self.completion
+        reset()
+        completion?(authorized)
+    }
+
+    isolated deinit {
+        browser?.cancel()
+        netService?.stop()
     }
 }
 
-extension LocalNetworkAuthorization : NetServiceDelegate {
-    public func netServiceDidPublish(_ sender: NetService) {
-        self.reset()
-        print("Local network permission has been granted")
-        completion?(true)
+extension LocalNetworkAuthorization: NetServiceDelegate {
+    nonisolated public func netServiceDidPublish(_ sender: NetService) {
+        let identity = ObjectIdentifier(sender)
+        Task { @MainActor [weak self] in
+            guard let self, let service = self.netService, ObjectIdentifier(service) == identity else { return }
+            self.complete(true)
+        }
+    }
+    nonisolated public func netService(_ sender: NetService, didNotPublish errorDict: [String: NSNumber]) {
+        let identity = ObjectIdentifier(sender)
+        Task { @MainActor [weak self] in
+            guard let self, let service = self.netService, ObjectIdentifier(service) == identity else { return }
+            self.complete(false)
+        }
     }
 }

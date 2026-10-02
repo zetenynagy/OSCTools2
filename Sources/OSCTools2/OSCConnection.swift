@@ -16,7 +16,10 @@ public class OSCConnection {
     
     public private(set) var status: ConnectivityStatus = .determining {
         didSet {
-            statusContinuation?.yield(status)
+            // Reconstruct a transferable value from the dependency's unannotated enum.
+            if let snapshot = ConnectivityStatus(rawValue: status.rawValue) {
+                statusContinuation?.yield(snapshot)
+            }
         }
     }
     @ObservationIgnored
@@ -35,7 +38,7 @@ public class OSCConnection {
         case disconnected
         case determining
         public var isOnline: Bool {
-            if case .connected(let connection, let withInternet) = self {
+            if case .connected(_, let withInternet) = self {
                 return withInternet
             }
             return false
@@ -92,7 +95,17 @@ public class OSCConnection {
     
     public private(set) var allIpAddresses: [String] = []
     
-    private let connectivity = Connectivity()
+    // Connectivity's default global queue races its mutable URLSession between checks.
+    // Keep its configuration, notifier, and status work on the same queue as this UI model.
+    // URLSession requests remain asynchronous; OSC traffic uses the independent cores.
+    private let connectivity = Connectivity(configuration: ConnectivityConfiguration(
+        callbackQueue: .main,
+        checkWhenApplicationDidBecomeActive: false,
+        connectivityQueue: .main,
+        pollingIsEnabled: false
+    ))
+    private var notifierGeneration: UInt64 = 0
+    private var isNotifying = false
     
     public init() {
         Logger.log(frequency: .verbose)
@@ -114,24 +127,42 @@ public class OSCConnection {
     }
     
     public func start() {
+        guard !isNotifying else { return }
+        isNotifying = true
         Logger.log(frequency: .verbose)
-        
-        connectivity.startNotifier()
+        notifierGeneration &+= 1
+        let generation = notifierGeneration
         
         connectivity.whenConnected = { [weak self] connectivity in
-            self?.status = connectivity.status
-            self?.check()
+            let rawStatus = connectivity.status.rawValue
+            Task { @MainActor [weak self] in
+                guard let self, self.notifierGeneration == generation,
+                      let status = ConnectivityStatus(rawValue: rawStatus) else { return }
+                self.status = status
+                self.check()
+            }
         }
         
         connectivity.whenDisconnected = { [weak self] connectivity in
-            self?.status = connectivity.status
-            self?.check()
+            let rawStatus = connectivity.status.rawValue
+            Task { @MainActor [weak self] in
+                guard let self, self.notifierGeneration == generation,
+                      let status = ConnectivityStatus(rawValue: rawStatus) else { return }
+                self.status = status
+                self.check()
+            }
         }
+        connectivity.startNotifier()
     }
     
     public func stop() {
+        guard isNotifying else { return }
+        isNotifying = false
         Logger.log(frequency: .verbose)
+        notifierGeneration &+= 1
         connectivity.stopNotifier()
+        connectivity.whenConnected = nil
+        connectivity.whenDisconnected = nil
     }
     
     /// Check IP Address
@@ -171,18 +202,26 @@ public class OSCConnection {
 #endif
     }
     
+    isolated deinit {
+        connectivity.stopNotifier()
+        statusContinuation?.finish()
+        currentIpAddressContinuation?.finish()
+    }
+
     private func getAddresses() -> [String] {
         var addresses = [String]()
 
         // Get list of all interfaces on the local machine:
         var ifaddr : UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&ifaddr) == 0 else { return [] }
+        defer { freeifaddrs(ifaddr) }
         guard let firstAddr = ifaddr else { return [] }
 
         // For each interface ...
         for ptr in sequence(first: firstAddr, next: { $0.pointee.ifa_next }) {
             let flags = Int32(ptr.pointee.ifa_flags)
-            var addr = ptr.pointee.ifa_addr.pointee
+            guard let interfaceAddress = ptr.pointee.ifa_addr else { continue }
+            let addr = interfaceAddress.pointee
 
             // Check for running IPv4, IPv6 interfaces. Skip the loopback interface.
             if (flags & (IFF_UP|IFF_RUNNING|IFF_LOOPBACK)) == (IFF_UP|IFF_RUNNING) {
@@ -190,16 +229,15 @@ public class OSCConnection {
 
                     // Convert interface address to a human readable string:
                     var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-                    if (getnameinfo(&addr, socklen_t(addr.sa_len), &hostname, socklen_t(hostname.count),
+                    if (getnameinfo(interfaceAddress, socklen_t(addr.sa_len), &hostname, socklen_t(hostname.count),
                                     nil, socklen_t(0), NI_NUMERICHOST) == 0) {
-                        let address = String(cString: hostname)
+                        let address = String(decoding: hostname.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
                         addresses.append(address)
                     }
                 }
             }
         }
 
-        freeifaddrs(ifaddr)
         return addresses.filter { address in
             address.contains(".")
         }

@@ -1,575 +1,298 @@
-//
-//  Created by Heestand XYZ on 2020-11-26.
-//  Copyright © 2020 Anton Heestand. All rights reserved.
-//
-
 import SwiftUI
 import OSCKit
-import Logger
-import Combine
+import os
 
-//@globalActor
-//private actor OSCActor {
-//    static let shared: OSCActor = .init()
-//    private init() {}
-//}
+/// App-facing facade. Settings and UI state are main-actor isolated; the transport cores are Sendable.
+@MainActor @Observable
+public class OSC {
+    nonisolated public let sender: OSCSender
+    nonisolated public let receiver: OSCReceiver
+    public let connection: OSCConnection
+    public let settings: OSCSettings
 
-@Observable
-public class OSC: OSCSettingsDelegate {
-    
-    private let queue: DispatchQueue
-    private let queueKey = DispatchSpecificKey<Void>()
-    
-    private struct SendSettings {
-        var clientAddress: String
-        var clientPort: UInt16
-    }
-    
-    @ObservationIgnored
-    private var sendSettings: SendSettings
-    @ObservationIgnored
-    private var sendActive: Bool = true
-    @ObservationIgnored
-    private var sendUpdatesRecentOutput: Bool = false
-    
-    @MainActor
-    public let connection: OSCConnection = .init()
-    public let settings: OSCSettings = .init()
-    
-#if !targetEnvironment(simulator)
-    @ObservationIgnored
-    private var client: OSCClient?
-    @ObservationIgnored
-    private var server: OSCServer?
-#endif
-    
-    private let localNetworkAuthorization = LocalNetworkAuthorization()
+    @ObservationIgnored nonisolated private let queue: DispatchQueue
+    @ObservationIgnored nonisolated private let pending = OSAllocatedUnfairLock(initialState: (input: false, output: false, errorGeneration: UInt64?.none))
+    @ObservationIgnored private let localNetworkAuthorization = LocalNetworkAuthorization()
+    @ObservationIgnored private var settingsObserver: UUID?
+    @ObservationIgnored private var observingLifecycle = false
+    @ObservationIgnored private var wantsRunning = false
+    @ObservationIgnored private var isTornDown = false
+    @ObservationIgnored private var recentInputTimer: Timer?
+    @ObservationIgnored private var recentOutputTimer: Timer?
 
-    @ObservationIgnored
-    private var isRunning: Bool = false
-    
-    @MainActor
-    public private(set) var isServerPortOpen: Bool = false
-    @MainActor
-    public private(set) var updateRecentInput: Bool = false
-    @MainActor
-    public private(set) var updateRecentOutput: Bool = false {
+    public private(set) var isServerPortOpen = false
+    public private(set) var lastError: String?
+    public private(set) var recentInput = false
+    public private(set) var recentOutput = false
+    public var updateRecentInput = false {
         didSet {
-            updateSendRecentOutput(updateRecentOutput)
+            if updateRecentInput {
+                receiver.setActivityHandler { [weak self] in self?.recordActivity(input: true) }
+            } else { receiver.setActivityHandler(nil) }
         }
     }
-    @MainActor
-    public private(set) var recentInput: Bool = false
-    @MainActor
-    public private(set) var recentOutput: Bool = false
-    
-    @ObservationIgnored
-    private var recentInputTimer: Timer?
-    @ObservationIgnored
-    private var recentOutputTimer: Timer?
-    
-    @ObservationIgnored
-    private var listeners: [UUID: (_ address: String, _ values: [any OSCValue]) -> ()] = [:]
-    
-    @ObservationIgnored
-    public var active: Bool = true {
+    public var updateRecentOutput = false {
         didSet {
-            updateSendActive(active)
-            if active {
+            if updateRecentOutput {
+                sender.setActivityHandler { [weak self] in self?.recordActivity(input: false) }
+            } else { sender.setActivityHandler(nil) }
+        }
+    }
+    public var active = true {
+        didSet {
+            guard active != oldValue else { return }
+            if active { start() } else { stop() }
+        }
+    }
+
+    public convenience init(queue: DispatchQueue = .main) {
+        self.init(settings: OSCSettings(), queue: queue)
+    }
+
+    /// Supply separate settings for independent OSC instances, or share them intentionally.
+    public init(settings: OSCSettings, queue: DispatchQueue = .main,
+                autoStart: Bool = true, manageLifecycle: Bool = true) {
+        self.settings = settings
+        self.queue = queue
+        sender = OSCSender(destination: OSCEndpoint(host: settings.clientAddress, port: Self.clampedPort(settings.clientPort)))
+        receiver = OSCReceiver(port: Self.clampedPort(settings.serverPort))
+        connection = OSCConnection()
+        settingsObserver = settings.observe { [weak self] change in self?.settingsChanged(change) }
+        if manageLifecycle { listenToApp() }
+        if autoStart { start() }
+        if let preferred = settings.preferredServerAddress { connection.setCurrent(ipAddress: preferred) }
+    }
+
+    public func start() {
+        guard !isTornDown, active else { return }
+        wantsRunning = true
+#if !targetEnvironment(simulator)
+        do {
+            try sender.start()
+            try receiver.start()
+            isServerPortOpen = receiver.isRunning
+            lastError = nil
+        } catch {
+            sender.stop()
+            isServerPortOpen = false
+            lastError = error.localizedDescription
+        }
+#endif
+    }
+
+    public func stop() {
+        wantsRunning = false
+        suspendTransport()
+    }
+
+    public func tearDown() {
+        guard !isTornDown else { return }
+        isTornDown = true
+        stop()
+        if let settingsObserver { settings.removeObserver(settingsObserver) }
+        settingsObserver = nil
+        NotificationCenter.default.removeObserver(self)
+        observingLifecycle = false
+        sender.setActivityHandler(nil)
+        receiver.setActivityHandler(nil)
+        recentInputTimer?.invalidate()
+        recentOutputTimer?.invalidate()
+        connection.stop()
+    }
+
+    private func suspendTransport() {
+        // Stop receiving before closing the sending socket.
+        receiver.stop()
+        sender.stop()
+        isServerPortOpen = false
+    }
+
+    private func settingsChanged(_ change: OSCSettings.Change) {
+        guard !isTornDown else { return }
+        switch change {
+        case .clientAddress, .clientPort:
+            sender.configure(destination: OSCEndpoint(host: settings.clientAddress, port: Self.clampedPort(settings.clientPort)))
+        case .serverPort:
+            configureReceiver(port: Self.clampedPort(settings.serverPort))
+        case .preferredServerAddress:
+            if let address = settings.preferredServerAddress { connection.setCurrent(ipAddress: address) }
+        }
+    }
+
+    // Retained public settings hooks.
+    public func setting(clientAddress: String) {
+        var endpoint = sender.destination ?? OSCEndpoint(host: clientAddress, port: Self.clampedPort(settings.clientPort))
+        endpoint.host = clientAddress
+        sender.configure(destination: endpoint)
+    }
+    public func setting(clientPort: Int) {
+        var endpoint = sender.destination ?? OSCEndpoint(host: settings.clientAddress, port: Self.clampedPort(clientPort))
+        endpoint.port = Self.clampedPort(clientPort)
+        sender.configure(destination: endpoint)
+    }
+    public func setting(serverPort: Int) {
+        configureReceiver(port: Self.clampedPort(serverPort))
+    }
+
+    private func configureReceiver(port: UInt16) {
+        do {
+            try receiver.configure(port: port)
+            if active, wantsRunning {
+                // Recover after a previous bind failure without reviving an explicitly paused facade.
                 start()
             } else {
-                stop()
+                isServerPortOpen = receiver.isRunning
+                lastError = nil
             }
+        } catch {
+            isServerPortOpen = receiver.isRunning
+            lastError = error.localizedDescription
         }
     }
-    
-    @ObservationIgnored
-    private var gate: Bool = false
-    @ObservationIgnored
-    private var lastValuesReceived: [String: String] = [:]
-    
-    // MARK: - Life Cycle -
-    
-    public init(queue: DispatchQueue = .main) {
-        self.queue = queue
-        sendSettings = SendSettings(
-            clientAddress: settings.clientAddress,
-            clientPort: Self.clampedPort(settings.clientPort)
-        )
-        queue.setSpecific(key: queueKey, value: ())
-        listenToApp()
-        Task { @MainActor in
-            setup()
-        }
-    }
-    
-    // MARK: - Setup
-    
-    @MainActor
-    private func setup() {
-        
-#if !targetEnvironment(simulator)
-        client = OSCClient()
-        
-        let port = UInt16(max(Int(UInt16.min), min(Int(UInt16.max), settings.serverPort)))
-        server = OSCServer(port: port) { [weak self] message, timeTag, host, port in
-            self?.take(message: message)
-        }
 
-        Task { @MainActor in
-            isServerPortOpen = OSC.isPortOpen(settings.serverPort)
-        }
-#endif
-        
-        settings.delegate = self
-        
-        start()
-        
-        Task { @MainActor in
-            if let serverIPAddress: String = settings.preferredServerAddress {
-                connection.check()
-                if connection.allIpAddresses.contains(serverIPAddress){
-                    connection.setCurrent(ipAddress: serverIPAddress)
-                }
-            }
-        }
-    }
-    
-    // MARK: - Tear Down
-    
-    public func tearDown() {
-        stop()
-#if !targetEnvironment(simulator)
-        client = nil
-        server = nil
-#endif
-    }
-    
-    // MARK: - App IO
-    
-    func listenToApp() {
-        
-        #if !os(macOS)
-        
-        NotificationCenter.default.addObserver(self, selector: #selector(didBecomeActive), name: UIApplication.didBecomeActiveNotification, object: nil)
-        NotificationCenter.default.addObserver(self, selector: #selector(willResignActive), name: UIApplication.willResignActiveNotification, object: nil)
-        NotificationCenter.default.addObserver(self, selector: #selector(willEnterForeground), name: UIApplication.willEnterForegroundNotification, object: nil)
-        NotificationCenter.default.addObserver(self, selector: #selector(didEnterBackground), name: UIApplication.didEnterBackgroundNotification, object: nil)
-        
-        #else
-        
-        NotificationCenter.default.addObserver(self, selector: #selector(didBecomeActive), name: NSApplication.didBecomeActiveNotification, object: nil)
-        NotificationCenter.default.addObserver(self, selector: #selector(willResignActive), name: NSApplication.willResignActiveNotification, object: nil)
-        NotificationCenter.default.addObserver(self, selector: #selector(willTerminate), name: NSApplication.willTerminateNotification, object: nil)
-        
-        #endif
-        
-    }
-    
-    @objc func didBecomeActive() {
-        
-        #if !os(macOS)
-        start()
-        #endif
-        
-        Task { @MainActor in
-            connection.start()
-            connection.check()
-        }
-    }
-    
-    @objc func willResignActive() {
-        
-        #if !os(macOS)
-        stop()
-        #endif
-        
-        Task { @MainActor in
-            connection.stop()
-        }
-    }
-    
-    @objc func willEnterForeground() {}
-    
-    @objc func didEnterBackground() {}
-    
-    @objc func willTerminate() {
-        stop()
-    }
-    
-    // MARK: - Set Preferred
-
-    @MainActor
     public func setPreferred(ipAddress: String) {
         connection.setCurrent(ipAddress: ipAddress)
         settings.preferredServerAddress = ipAddress
     }
-
-    @MainActor
     public func resetPreferredIPAddress() {
         connection.resetCurrentIPAddress()
         settings.preferredServerAddress = nil
     }
-    
-    // MARK: - Listen
-    
-    public func unlisten(id: UUID) {
-        listeners.removeValue(forKey: id)
-    }
-    
-    @discardableResult
-    public func backgroundListen<T: OSCType>(
-        to address: @escaping () -> (String),
-        _ callback: @escaping (T) -> ()
-    ) -> UUID {
-        backgroundListenToAny(to: address) { value in
-            callback(T.convert(value: value))
-        }
-    }
-    
-    @discardableResult
-    public func backgroundListenToArray<T: OSCType>(
-        to address: @escaping () -> (String),
-        _ callback: @escaping ([T]) -> ()
-    ) -> UUID {
-        backgroundListenToAnyArray(to: address) { values in
-            callback(values.map({ T.convert(value: $0) }))
-        }
-    }
-    
-    @discardableResult
-    public func backgroundListenToAny(
-        to address: @escaping () -> (String),
-        _ callback: @escaping (any OSCValue) -> ()
-    ) -> UUID {
-        let id = UUID()
-        listeners[id] = { [weak self] valueAddress, values in
-            guard let self = self else { return }
-            guard self.wildcardMatch(valueAddress, with: address()) else { return }
-            guard let value: any OSCValue = values.first else { return }
-            callback(value)
-        }
-        return id
-    }
-    
-    @discardableResult
-    public func backgroundListenToAnyArray(
-        to address: @escaping () -> (String),
-        _ callback: @escaping ([any OSCValue]) -> ()
-    ) -> UUID {
-        let id = UUID()
-        listeners[id] = { [weak self] valueAddress, values in
-            guard let self = self else { return }
-            guard self.wildcardMatch(valueAddress, with: address()) else { return }
-            callback(values)
-        }
-        return id
-    }
-    
-    @discardableResult
-    public func backgroundListenToAnyArrayAsync(
-        to address: @escaping () async -> (String?),
-        _ callback: @escaping ([any OSCValue]) -> ()
-    ) -> UUID {
-        let id = UUID()
-        listeners[id] = { [weak self] valueAddress, values in
-            guard let self = self else { return }
-            Task {
-                guard let address = await address() else { return }
-                guard self.wildcardMatch(valueAddress, with: address) else { return }
-                callback(values)
-            }
-        }
-        return id
-    }
-    
-    @discardableResult
-    public func backgroundListenToAll(
-        _ callback: @escaping (String, [any OSCValue]) -> ()
-    ) -> UUID {
-        let id = UUID()
-        listeners[id] = callback
-        return id
-    }
-    
-    // MARK: - Send
-    
-    public func send(value: any OSCValue, address: String) {
+
+    // Legacy send preserves numeric conversion and the caller's configured sending queue.
+    nonisolated public func send(value: any OSCValue, address: String) {
         send(values: [value], address: address)
     }
-    
-    public func send(values: [any OSCValue], address: String) {
-        let values = values.map(Self.sendValue)
-        performOnQueue { [self] in
-            sendOnQueue(values: values, address: address)
+    nonisolated public func send(values: [any OSCValue], address: String) {
+        guard let generation = sender.activeGeneration else { return }
+        let values = values.map { value -> any OSCValue in
+            if let value = value as? CGFloat { return Float(value) }
+            if let value = value as? Double { return Float(value) }
+            return value
         }
-    }
-    
-    private static func sendValue(_ value: any OSCValue) -> any OSCValue {
-        if let float = value as? CGFloat {
-            Float(float)
-        } else if let double = value as? Double {
-            Float(double)
-        } else {
-            value
-        }
-    }
-    
-    private func sendOnQueue(values: [any OSCValue], address: String) {
-        guard sendActive else { return }
-        
-        Logger.log(arguments: ["address": address, "values": values], frequency: .loop)
-        
-#if !targetEnvironment(simulator)
-        do {
-            let message: OSCMessage = .message(address, values: values)
-            try client?.send(message, to: sendSettings.clientAddress, port: sendSettings.clientPort)
-        } catch {
-            Logger.log(.error(error), message: "OSC Message Failed to Send", arguments: ["address": address, "values": values])
-        }
-        if sendUpdatesRecentOutput {
-            Task { @MainActor in
-                setRecentOutput()
-            }
-        }
-#endif
-    }
-    
-    // MARK: - Take
-
-    private func take(message: OSCMessage) {
-        
-        guard active else { return }
-        
-        let address: String = message.addressPattern.stringValue
-        let values: [any OSCValue] = message.values
-        
-        for (_, callback) in listeners {
-            callback(address, values)
-        }
-        
-        Task { @MainActor in
-            /// Indication
-            if updateRecentInput {
-                setRecentInput()
-            }
+        queue.async { [weak self, sender] in
+            do { try sender.send(values: values, address: address, generation: generation) }
+            catch OSCTransportError.notRunning { /* Pausing invalidates queued sends. */ }
+            catch { self?.reportSendError(error.localizedDescription, generation: generation) }
         }
     }
 
-    private func take(bundle: OSCBundle) {
-        
-        guard active else { return }
-        
-        for element in bundle.elements {
-            guard let message = element as? OSCMessage else { continue }
-            take(message: message)
-        }
+    /// Forwards a decoded message without coercion or an additional dispatch hop.
+    nonisolated public func relay(_ message: OSCMessage, to host: String, port: UInt16) throws {
+        try sender.send(message, to: host, port: port)
     }
-    
-    // MARK: - Wildcard
-    
-    private func wildcardMatch(_ sourceAddress: String, with targetAddress: String) -> Bool {
-        if sourceAddress == targetAddress {
+
+    nonisolated private func reportSendError(_ description: String, generation: UInt64) {
+        let report = pending.withLock { state in
+            guard state.errorGeneration != generation else { return false }
+            state.errorGeneration = generation
             return true
         }
-        var sourceIndex: Int = 0
-        var targetIndex: Int = 0
-        var inWildcard: Bool = false
-        loop: for sourceCharacter in sourceAddress {
-            defer {
-                sourceIndex += 1
-            }
-            if sourceCharacter == "*" {
-                inWildcard = true
-                if sourceAddress.count > sourceIndex + 1 {
-                    let nextSourceCharacter = sourceAddress[sourceIndex + 1]
-                    while true {
-                        guard targetAddress.count > targetIndex else { return false }
-                        let targetCharacter = targetAddress[targetIndex]
-                        if nextSourceCharacter == targetCharacter {
-                            continue loop
-                        }
-                        targetIndex += 1
-                    }
-                    continue
-                } else {
-                    return true
-                }
-            }
-            guard targetAddress.count > targetIndex else { return inWildcard }
-            let targetCharacter = targetAddress[targetIndex]
-            if targetCharacter != sourceCharacter {
-                return false
-            }
-            targetIndex += 1
+        guard report else { return }
+        Task { @MainActor [weak self] in
+            guard let self, self.sender.activeGeneration == generation, !self.isTornDown else { return }
+            self.lastError = description
         }
-        return targetAddress.count == targetIndex
     }
-    
-    // MARK: - Filter NaN
-    
-    func filterNaN(_ value: any OSCValue) -> any OSCValue {
-        if let cgFloat = value as? CGFloat {
-            if !cgFloat.isFinite {
-                return CGFloat(0.0)
+
+    nonisolated private func recordActivity(input: Bool) {
+        let schedule = pending.withLock { state in
+            if input {
+                guard !state.input else { return false }
+                state.input = true
+            } else {
+                guard !state.output else { return false }
+                state.output = true
             }
-        } else if let float = value as? Float {
-            if !float.isFinite {
-                return Float(0.0)
-            }
-        } else if let double = value as? Double {
-            if !double.isFinite {
-                return Double(0.0)
-            }
+            return true
         }
-        return value
-    }
-    
-    // MARK: - Start / Stop
-    
-    public func start() {
-        if self.isRunning {
-            self.stop()
+        guard schedule else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.pending.withLock { if input { $0.input = false } else { $0.output = false } }
+            guard !self.isTornDown else { return }
+            if input { self.setRecentInput() } else { self.setRecentOutput() }
         }
-#if !targetEnvironment(simulator)
-        do {
-            try self.server?.start()
-            try self.client?.start()
-            isRunning = true
-        } catch {
-            Logger.log(.error(error), frequency: .verbose)
-        }
-#endif
     }
-    
-    public func stop() {
-#if !targetEnvironment(simulator)
-        client?.stop()
-        server?.stop()
-#endif
-        isRunning = false
-    }
-    
-    // MARK: - Recent
-    
-    @MainActor
     func setRecentInput() {
         recentInput = true
         recentInputTimer?.invalidate()
-        recentInputTimer = Timer(timeInterval: 0.25, repeats: false, block: { [weak self] t in
-            Task { @MainActor in
-                self?.recentInput = false
-            }
-        })
-        RunLoop.current.add(recentInputTimer!, forMode: .common)
+        let timer = Timer(timeInterval: 0.25, repeats: false) { [weak self] _ in
+            Task { @MainActor in self?.recentInput = false }
+        }
+        recentInputTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
     }
-    
-    @MainActor
     func setRecentOutput() {
         recentOutput = true
         recentOutputTimer?.invalidate()
-        recentOutputTimer = Timer(timeInterval: 0.25, repeats: false, block: { [weak self] t in
-            Task { @MainActor in
-                self?.recentOutput = false
-            }
-        })
-        RunLoop.current.add(recentOutputTimer!, forMode: .common)
-    }
-    
-    // MARK: - Authorization
-    
-    public func authorize(completion: ((Bool) -> ())? = nil) {
-        localNetworkAuthorization.requestAuthorization { authorized in
-            DispatchQueue.main.async {
-                completion?(authorized)
-            }
+        let timer = Timer(timeInterval: 0.25, repeats: false) { [weak self] _ in
+            Task { @MainActor in self?.recentOutput = false }
         }
+        recentOutputTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
     }
-    
-    // MARK: - Port
-    
-    public static func isPortOpen(_ port: Int) -> Bool {
-        isPortOpen(port: in_port_t(clampedPort(port)))
-    }
-    
-    static func isPortOpen(port: in_port_t) -> Bool {
-        
-        let socketFileDescriptor = socket(AF_INET, SOCK_STREAM, 0)
-        if socketFileDescriptor == -1 {
-            return false
-        }
 
-        var addr = sockaddr_in()
-        let sizeOfSockkAddr = MemoryLayout<sockaddr_in>.size
-        addr.sin_len = __uint8_t(sizeOfSockkAddr)
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = Int(OSHostByteOrder()) == OSLittleEndian ? _OSSwapInt16(port) : port
-        addr.sin_addr = in_addr(s_addr: inet_addr("0.0.0.0"))
-        addr.sin_zero = (0, 0, 0, 0, 0, 0, 0, 0)
-        var bind_addr = sockaddr()
-        memcpy(&bind_addr, &addr, Int(sizeOfSockkAddr))
+    public func authorize(completion: ((Bool) -> Void)? = nil) {
+        localNetworkAuthorization.requestAuthorization { completion?($0) }
+    }
 
-        if Darwin.bind(socketFileDescriptor, &bind_addr, socklen_t(sizeOfSockkAddr)) == -1 {
-            return false
-        }
-        let isOpen = Darwin.listen(socketFileDescriptor, SOMAXCONN ) != -1
-        Darwin.close(socketFileDescriptor)
-        return isOpen
+    func listenToApp() {
+        guard !observingLifecycle else { return }
+        observingLifecycle = true
+#if os(macOS)
+        NotificationCenter.default.addObserver(self, selector: #selector(didBecomeActive), name: NSApplication.didBecomeActiveNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(willResignActive), name: NSApplication.willResignActiveNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(willTerminate), name: NSApplication.willTerminateNotification, object: nil)
+#else
+        NotificationCenter.default.addObserver(self, selector: #selector(didBecomeActive), name: UIApplication.didBecomeActiveNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(willResignActive), name: UIApplication.willResignActiveNotification, object: nil)
+#endif
     }
-    
-    // MARK: - Settings Delegate
-    
-    public func setting(clientAddress: String) {
-        updateSendSettings { sendSettings in
-            sendSettings.clientAddress = clientAddress
-        }
+    @objc func didBecomeActive() {
+        guard !isTornDown else { return }
+#if !os(macOS)
+        if active, wantsRunning { start() }
+#endif
+        connection.start()
+        connection.check()
     }
-    
-    func setting(preferredServerAddress: String?) {}
-    
-    public func setting(clientPort: Int) {
-        updateSendSettings { sendSettings in
-            sendSettings.clientPort = Self.clampedPort(clientPort)
-        }
+    @objc func willResignActive() {
+#if !os(macOS)
+        suspendTransport()
+#endif
+        connection.stop()
     }
-    
-    public func setting(serverPort: Int) {
-        tearDown()
-        Task { @MainActor in
-            isServerPortOpen = OSC.isPortOpen(port: in_port_t(serverPort))
-            setup()
-        }
-    }
-    
-    // MARK: - Send Queue
-    
-    private func performOnQueue(_ work: @escaping () -> Void) {
-        if DispatchQueue.getSpecific(key: queueKey) != nil {
-            work()
-        } else {
-            queue.async(execute: work)
-        }
-    }
-    
-    private func updateSendSettings(_ update: @escaping (inout SendSettings) -> Void) {
-        performOnQueue { [self] in
-            update(&sendSettings)
+    @objc func willTerminate() { stop() }
+
+    /// Tests whether a UDP port can currently be bound. Successful probing does not reserve it.
+    nonisolated public static func isPortOpen(_ port: Int) -> Bool {
+        let port = clampedPort(port)
+        guard port > 0 else { return false }
+        let descriptor = socket(AF_INET, SOCK_DGRAM, 0)
+        guard descriptor >= 0 else { return false }
+        defer { Darwin.close(descriptor) }
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = port.bigEndian
+        return withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
+            }
         }
     }
-    
-    private func updateSendActive(_ active: Bool) {
-        performOnQueue { [self] in
-            sendActive = active
-        }
+    nonisolated private static func clampedPort(_ port: Int) -> UInt16 {
+        UInt16(clamping: port)
     }
-    
-    private func updateSendRecentOutput(_ isEnabled: Bool) {
-        performOnQueue { [self] in
-            sendUpdatesRecentOutput = isEnabled
-        }
-    }
-    
-    private static func clampedPort(_ port: Int) -> UInt16 {
-        UInt16(max(Int(UInt16.min), min(Int(UInt16.max), port)))
+
+    isolated deinit {
+        receiver.stop()
+        sender.stop()
+        if let settingsObserver { settings.removeObserver(settingsObserver) }
+        NotificationCenter.default.removeObserver(self)
+        recentInputTimer?.invalidate()
+        recentOutputTimer?.invalidate()
+        connection.stop()
     }
 }

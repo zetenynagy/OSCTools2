@@ -18,6 +18,8 @@ public class OSC {
     @ObservationIgnored private var wantsRunning = false
     @ObservationIgnored private var isTornDown = false
     @ObservationIgnored private var sendingInterfaceAvailable = true
+    /// Started and not suspended, independent of whether the receive port could be bound.
+    @ObservationIgnored private var isTransportStarted = false
     @ObservationIgnored private var recentInputTimer: Timer?
     @ObservationIgnored private var recentOutputTimer: Timer?
 
@@ -81,26 +83,26 @@ public class OSC {
         wantsRunning = true
         connection.check()
 #if !targetEnvironment(simulator)
+        isTransportStarted = true
+        // A receive-port conflict must not interrupt sending, which binds its own ephemeral port.
+        var receiverError: String?
         do {
             try receiver.start()
-            isServerPortOpen = receiver.isRunning
         } catch {
-            sender.stop()
-            isServerPortOpen = false
-            lastError = error.localizedDescription
-            return
+            receiverError = error.localizedDescription
         }
+        isServerPortOpen = receiver.isRunning
         guard sendingInterfaceAvailable else {
             sender.stop()
-            lastError = unavailableInterfaceDescription
+            lastError = receiverError ?? unavailableInterfaceDescription
             return
         }
         do {
             try sender.start()
-            lastError = nil
+            lastError = receiverError
         } catch {
             // A send-side bind failure must not interrupt wildcard receiving.
-            lastError = error.localizedDescription
+            lastError = receiverError ?? error.localizedDescription
         }
 #endif
     }
@@ -132,6 +134,7 @@ public class OSC {
         receiver.stop()
         sender.stop()
         isServerPortOpen = false
+        isTransportStarted = false
     }
 
     private func settingsChanged(_ change: OSCSettings.Change) {
@@ -201,7 +204,7 @@ public class OSC {
                 lastError = unavailableInterfaceDescription
             } else {
 #if !targetEnvironment(simulator)
-                if active, wantsRunning, receiver.isRunning { try sender.start() }
+                if active, wantsRunning, isTransportStarted { try sender.start() }
 #endif
                 lastError = nil
             }

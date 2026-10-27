@@ -48,8 +48,9 @@ extension OSCReceiver {
         return id
     }
 
-    // Preserve the legacy received-address wildcard direction, including '*' across path separators.
-    static func matches(_ source: String, target: String) -> Bool {
+    /// Whether a received address matches a local address. Preserves the legacy direction where
+    /// wildcards in the received address match the local address, including '*' across path separators.
+    public static func matches(_ source: String, target: String) -> Bool {
         if source == target { return true }
         guard source.contains("*") else { return false }
         let source = Array(source), target = Array(target)

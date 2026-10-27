@@ -119,16 +119,25 @@ struct OSCLoopbackTests {
         #expect(osc.lastError == nil)
     }
 
-    @Test @MainActor func changingBusyPortRecoversFacadeWithoutRevivingPause() throws {
-        let ports = try freePorts(2)
+    @Test @MainActor func busyReceivePortKeepsSendingAndChangingPortRecoversWithoutRevivingPause() async throws {
+        let ports = try freePorts(3)
         let blocker = OSCReceiver(port: ports[0])
         try blocker.start()
-        let settings = OSCSettings(serverPort: Int(ports[0]), persistence: .none)
-        let osc = OSC(settings: settings, manageLifecycle: false)
-        defer { osc.tearDown(); blocker.stop() }
+        let target = OSCReceiver(port: ports[2])
+        let stream = AsyncStream<OSCMessage>.makeStream()
+        target.backgroundListenToMessages { message, _, _, _ in stream.continuation.yield(message) }
+        try target.start()
+        let settings = OSCSettings(clientAddress: "127.0.0.1", clientPort: Int(ports[2]),
+                                   serverPort: Int(ports[0]), persistence: .none)
+        let osc = OSC(settings: settings, queue: DispatchQueue(label: "busy-send"), manageLifecycle: false)
+        defer { osc.tearDown(); blocker.stop(); target.stop(); stream.continuation.finish() }
         #expect(osc.lastError != nil)
         #expect(!osc.receiver.isRunning)
-        #expect(!osc.sender.isRunning)
+        #expect(!osc.isServerPortOpen)
+        #expect(osc.sender.isRunning, "A busy receive port must not stop sending")
+        osc.send(values: [Int32(1)], address: "/busy")
+        let received = try await receive(stream.stream)
+        #expect(received[0].addressPattern.stringValue == "/busy")
         settings.serverPort = Int(ports[1])
         #expect(osc.receiver.isRunning)
         #expect(osc.sender.isRunning)

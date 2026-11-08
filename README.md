@@ -8,7 +8,7 @@ Swift 6.4 OSC tools for iOS 17, tvOS 17, macOS 14, and visionOS 1 or later.
 
 ```swift
 import OSCTools2
-import OSCKit
+import SwiftOSC
 
 let sender = OSCSender(destination: OSCEndpoint(host: "127.0.0.1", port: 9001))
 let receiver = OSCReceiver(port: 9000)

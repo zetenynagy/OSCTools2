@@ -14,8 +14,8 @@ let package = Package(
         .library(name: "OSCTools2", targets: ["OSCTools2"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/orchetect/OSCKit", from: "1.2.1"),
-        // OSCKit's existing socket dependency, used to constrain UDP routing.
+        .package(url: "https://github.com/orchetect/swift-osc", from: "3.1.0"),
+        // SwiftOSC's existing socket dependency, used to constrain UDP routing.
         .package(url: "https://github.com/robbiehanson/CocoaAsyncSocket", from: "7.6.5"),
         .package(url: "https://github.com/heestand-xyz/Logger", from: "0.3.0"),
         .package(url: "https://github.com/rwbutler/connectivity", from: "6.1.1"),
@@ -24,7 +24,7 @@ let package = Package(
         .target(
             name: "OSCTools2",
             dependencies: [
-                "OSCKit",
+                .product(name: "SwiftOSC", package: "swift-osc"),
                 "CocoaAsyncSocket",
                 .product(name: "Connectivity", package: "connectivity"),
                 "Logger"

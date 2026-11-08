@@ -1,6 +1,6 @@
 import Darwin
 import Foundation
-import OSCKit
+import SwiftOSC
 import Testing
 import os
 @testable import OSCTools2

@@ -1,5 +1,5 @@
 import Foundation
-import OSCKit
+import SwiftOSC
 import CocoaAsyncSocket
 import os
 

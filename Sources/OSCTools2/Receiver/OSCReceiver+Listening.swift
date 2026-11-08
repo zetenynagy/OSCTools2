@@ -1,5 +1,5 @@
 import Foundation
-import OSCKit
+import SwiftOSC
 
 extension OSCReceiver {
     @discardableResult

@@ -1,5 +1,5 @@
 import Foundation
-import OSCKit
+import SwiftOSC
 import XCTest
 import os
 @testable import OSCTools2

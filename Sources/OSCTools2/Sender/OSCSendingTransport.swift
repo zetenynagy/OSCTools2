@@ -1,5 +1,5 @@
 import Foundation
-import OSCKit
+import SwiftOSC
 
 protocol OSCSendingTransport: Sendable {
     func start() throws

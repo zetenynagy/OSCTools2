@@ -1,5 +1,5 @@
 import Foundation
-import OSCKit
+import SwiftOSC
 import os
 
 /// An independent, thread-safe receiver with explicit lifecycle and ordered message delivery.

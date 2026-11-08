@@ -1,5 +1,5 @@
 import SwiftUI
-import OSCKit
+import SwiftOSC
 import os
 
 /// App-facing facade. Settings and UI state are main-actor isolated; the transport cores are Sendable.

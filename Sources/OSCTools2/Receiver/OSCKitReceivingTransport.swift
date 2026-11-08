@@ -1,7 +1,7 @@
 import Foundation
-import OSCKit
+import SwiftOSC
 
-struct OSCKitReceivingTransport: OSCReceivingTransport {
+struct SwiftOSCReceivingTransport: OSCReceivingTransport {
     private let server: OSCServer
     init(port: UInt16, queue: DispatchQueue, handler: @escaping OSCHandlerBlock) {
         server = OSCServer(port: port, receiveQueue: queue, handler: handler)

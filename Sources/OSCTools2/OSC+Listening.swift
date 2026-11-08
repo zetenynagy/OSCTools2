@@ -1,5 +1,5 @@
 import Foundation
-import OSCKit
+import SwiftOSC
 
 extension OSC {
     nonisolated public func unlisten(id: UUID) { receiver.unlisten(id: id) }
